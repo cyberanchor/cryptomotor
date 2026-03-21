@@ -23,16 +23,17 @@
 
 <br>
 
-[Installation](#installation) •
-[Usage](#usage) •
-[Cryptographic Architecture](#cryptographic-architecture) •
-[All Flags](#all-flags)
+[installation](#installation) •
+[usage](#usage) •
+[cryptographic architecture](#cryptographic-architecture) •
+[all flags](#all-flags) •
+[release](https://github.com/cyberanchor/cryptomotor/releases/tag/v3.1.0)
 
 </div>
 
 -----
 
-## Cryptographic Architecture
+## Cryptographic architecture
 
 ```text
 Password
@@ -64,7 +65,7 @@ Password
   └────────────────────────┘
 ```
 
-### Streaming Encryption
+### Streaming encryption
 
 Large files are never loaded entirely into memory. The payload is split into
 64 MiB chunks, each encrypted with a unique nonce derived from `base_nonce ⊕ counter`.
@@ -93,6 +94,7 @@ with a zero-length sentinel.
 ### From source (current platform)
 
 ```bash
+git clone https://github.com/cyberanchor/cryptomotor
 cd cryptomotor
 make build
 # ZIP archive with binary + README appears in output/
@@ -185,5 +187,5 @@ cryptomotor --encrypt --file ./data.bin --password mypass --low-memory
 
 ## Disclaimer
 
-cryptomotor is intended exclusively for personal, lawful use. The author
+`cryptomotor` is intended exclusively for personal, lawful use. The author
 is not responsible for any misuse of this software.
