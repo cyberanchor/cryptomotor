@@ -1,3 +1,0 @@
-eeb02ca3a9320303ec9ac092a95a822f5e3fbb4101ccbc489de1be3b55ef1fce  cryptomotor_v3.1.0_linux_amd64.zip
-5591dd035409edfad98fc59700e0c5b01c7d01d39db74d65ffa88140698e2f4f  cryptomotor_v3.1.0_linux_arm64.zip
-62689b02cc65d15f158209bcc96f4c6eb5235a344db43062d8951ee7db5d5335  cryptomotor_v3.1.0_windows_amd64.zip
