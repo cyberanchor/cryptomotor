@@ -17,7 +17,7 @@ const (
 
 	// ProgramVersion follows semver; bump on every format or behaviour change.
 	// The Makefile and the release workflow read the version from this line.
-	ProgramVersion = "3.0.0"
+	ProgramVersion = "3.2.0"
 )
 
 // ---------------------------------------------------------------------

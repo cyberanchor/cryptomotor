@@ -1,0 +1,4 @@
+# Test vectors are compared byte for byte: never convert line endings
+# (Windows checkouts use core.autocrlf).
+internal/fileproc/testdata/** -text
+*.cm binary

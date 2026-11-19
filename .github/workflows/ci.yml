@@ -1,0 +1,85 @@
+name: ci
+
+# Runs on every push to main, on pull requests and by hand.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # An exact version: release binaries are reproducible only with the same toolchain.
+  GO_VERSION: '1.27.4'
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The three release targets: linux/amd64, linux/arm64, windows/amd64.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: false
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run all tests
+        run: go test -count=1 ./...
+
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+          cache: false
+
+      - name: Formatting, vet for Linux and Windows, module checksums
+        run: make check
+
+      - name: Run tests under the race detector
+        run: make race
+
+      - name: Check dependencies and the Go version for known vulnerabilities
+        run: make vulncheck
+
+      - name: Fetch the 3.1.0 release for the compatibility tests
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/v310"
+          mkdir -p "${dir}"
+          curl -fsSL -o "${dir}/v310.zip" \
+            https://github.com/cyberanchor/cryptomotor/releases/download/v3.1.0/cryptomotor_v3.1.0_linux_amd64.zip
+          echo "eeb02ca3a9320303ec9ac092a95a822f5e3fbb4101ccbc489de1be3b55ef1fce  ${dir}/v310.zip" | sha256sum -c -
+          unzip -q "${dir}/v310.zip" cryptomotor -d "${dir}"
+
+      # The runner has enough RAM, so this also runs the 4 GiB Argon2id setting.
+      - name: Run the end-to-end tests
+        run: make e2e OLD="${RUNNER_TEMP}/v310/cryptomotor"
+
+      - name: Verify the release archives are reproducible
+        run: make verify-reproducible
