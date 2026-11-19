@@ -1,7 +1,9 @@
 package fileproc_test
 
 import (
+	"bytes"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,7 +15,7 @@ import (
 
 func init() {
 	// Suppress log output during tests.
-	logger.Init("", false, false)
+	logger.Init("", false, false, false)
 }
 
 // quietOpts returns options suitable for silent testing.
@@ -129,16 +131,27 @@ func TestAnalyze(t *testing.T) {
 	}
 }
 
-// TestFileTooSmall verifies that files below MinFileSize are rejected.
-func TestFileTooSmall(t *testing.T) {
-	dir := t.TempDir()
-	inputPath := filepath.Join(dir, "tiny.txt")
-	os.WriteFile(inputPath, []byte("ab"), 0o644) // 2 bytes < MinFileSize=4
+// TestTinyFiles verifies that empty and very small files round-trip: the
+// format needs no minimum size (3.1.0 refused files under 4 bytes).
+func TestTinyFiles(t *testing.T) {
+	for n := 0; n < 4; n++ {
+		dir := t.TempDir()
+		inputPath := filepath.Join(dir, "tiny.txt")
+		os.WriteFile(inputPath, []byte("abc")[:n], 0o644)
 
-	opts := quietOpts(config.CipherChaCha20Poly1305)
-	_, err := fileproc.EncryptFile(inputPath, filepath.Join(dir, "enc"), []byte("pass"), opts)
-	if err == nil {
-		t.Fatal("expected error for file too small")
+		opts := quietOpts(config.CipherChaCha20Poly1305)
+		encPath, err := fileproc.EncryptFile(inputPath, filepath.Join(dir, "enc"), []byte("pass"), opts)
+		if err != nil {
+			t.Fatalf("%d bytes: %v", n, err)
+		}
+		decPath, err := fileproc.DecryptFile(encPath, filepath.Join(dir, "dec"), []byte("pass"), opts)
+		if err != nil {
+			t.Fatalf("%d bytes: decrypt: %v", n, err)
+		}
+		got, _ := os.ReadFile(decPath)
+		if string(got) != "abc"[:n] {
+			t.Fatalf("%d bytes: got %q", n, got)
+		}
 	}
 }
 
@@ -183,23 +196,25 @@ func TestDryRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The encrypted directory should not exist (or be empty).
-	entries, _ := os.ReadDir(encDir)
-	if len(entries) > 0 {
-		t.Fatal("dry run should not create output files")
+	// Nothing may be created, not even the output directory.
+	if _, err := os.Stat(encDir); !os.IsNotExist(err) {
+		t.Fatalf("dry run created %s (err %v)", encDir, err)
 	}
 }
 
-// TestProcessFolder verifies batch encryption and decryption of a folder.
+// TestProcessFolder verifies batch encryption and decryption of a folder and
+// compares every decrypted file with its original.
 func TestProcessFolder(t *testing.T) {
 	dir := t.TempDir()
 
 	// Create several test files.
+	originals := map[string][]byte{}
 	for i := 0; i < 5; i++ {
-		name := filepath.Join(dir, "file_"+string(rune('a'+i))+".txt")
+		name := "file_" + string(rune('a'+i)) + ".txt"
 		data := make([]byte, 1000+i*500)
 		rand.Read(data)
-		os.WriteFile(name, data, 0o644)
+		os.WriteFile(filepath.Join(dir, name), data, 0o644)
+		originals[name] = data
 	}
 
 	password := []byte("folder-pass")
@@ -220,9 +235,22 @@ func TestProcessFolder(t *testing.T) {
 	if err := fileproc.ProcessFolder(encDir, password, "decrypt", opts); err != nil {
 		t.Fatalf("decrypt folder: %v", err)
 	}
+	for name, want := range originals {
+		got, err := os.ReadFile(filepath.Join(encDir, "decrypted", name))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+
+	// A wrong password must be reported, not swallowed.
+	err := fileproc.ProcessFolder(encDir, []byte("wrong"), "decrypt", opts)
+	if !errors.Is(err, fileproc.ErrFolderFailures) {
+		t.Fatalf("wrong password in folder mode: %v", err)
+	}
 }
 
-// TestCorruptedFile verifies that a truncated file is rejected.
+// TestCorruptedFile verifies that truncation is rejected, both inside the
+// header and inside the payload.
 func TestCorruptedFile(t *testing.T) {
 	dir := t.TempDir()
 	inputPath := filepath.Join(dir, "corrupt_src.txt")
@@ -235,12 +263,13 @@ func TestCorruptedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	info, _ := os.Stat(encPath)
+	orig, _ := os.ReadFile(encPath)
 
-	// Truncate the encrypted file.
-	os.Truncate(encPath, 100)
-
-	_, err = fileproc.DecryptFile(encPath, filepath.Join(dir, "dec"), []byte("pass"), opts)
-	if err == nil {
-		t.Fatal("expected error for corrupted file")
+	for _, size := range []int64{100, int64(config.SystemBlockLen), info.Size() - 1, info.Size() - 5} {
+		os.WriteFile(encPath, orig[:size], 0o640)
+		if _, err := fileproc.DecryptFile(encPath, filepath.Join(dir, "dec"), []byte("pass"), opts); err == nil {
+			t.Fatalf("file truncated to %d bytes was accepted", size)
+		}
 	}
 }

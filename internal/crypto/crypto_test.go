@@ -2,11 +2,13 @@ package crypto_test
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha512"
 	"io"
-	"os"
-	"path/filepath"
 	"testing"
+
+	"golang.org/x/crypto/chacha20"
 
 	"cryptomotor/internal/config"
 	"cryptomotor/internal/crypto"
@@ -102,57 +104,64 @@ func TestHMACVerify(t *testing.T) {
 	}
 }
 
-// TestStreamRoundTrip verifies streaming encryption+decryption for both ciphers.
+// TestStreamRoundTrip verifies streaming encryption+decryption for both ciphers
+// with the real 64 MiB chunk size: 3 full chunks plus a partial one. The data
+// flows through a pipe and only hashes are compared, so the test needs about
+// two chunk buffers of memory instead of three copies of the whole stream.
 func TestStreamRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("192 MiB stream: skipped with -short")
+	}
 	key := make([]byte, 32)
 	rand.Read(key)
-
-	// Create test data: 3 chunks + partial to exercise boundary conditions.
-	plaintext := make([]byte, config.ChunkSize*3+12345)
-	rand.Read(plaintext)
+	const size = config.ChunkSize*3 + 12345
 
 	for _, cid := range []config.CipherID{config.CipherAES256GCM, config.CipherChaCha20Poly1305} {
 		t.Run(cid.String(), func(t *testing.T) {
 			aead, _ := crypto.NewAEAD(key, cid)
 			baseNonce, _ := crypto.GenerateNonce(aead)
+			src := sha512.New()
+			plain := io.TeeReader(io.LimitReader(newPRNG(cid), size), src)
 
-			// Encrypt.
-			var ctBuf bytes.Buffer
-			_, err := crypto.EncryptStream(aead, baseNonce, bytes.NewReader(plaintext), &ctBuf, false, int64(len(plaintext)))
+			pr, pw := io.Pipe()
+			go func() {
+				_, err := crypto.EncryptStream(aead, baseNonce, config.ChunkSize, plain, pw, false, size)
+				pw.CloseWithError(err)
+			}()
+			dst := sha512.New()
+			n, err := crypto.DecryptStream(aead, baseNonce, pr, dst, false, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			// Decrypt.
-			var ptBuf bytes.Buffer
-			_, err = crypto.DecryptStream(aead, baseNonce, &ctBuf, &ptBuf, false, int64(ctBuf.Len()))
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if !bytes.Equal(ptBuf.Bytes(), plaintext) {
-				t.Fatalf("stream round-trip failed: got %d bytes, want %d", ptBuf.Len(), len(plaintext))
+			if n != size || !bytes.Equal(dst.Sum(nil), src.Sum(nil)) {
+				t.Fatalf("stream round-trip failed: got %d bytes, want %d", n, size)
 			}
 		})
 	}
 }
 
-// TestHashFile verifies SHA-512 file hashing matches stdlib.
-func TestHashFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "testfile.bin")
+// newPRNG returns a fast deterministic byte stream (ChaCha20 keystream).
+func newPRNG(seed config.CipherID) io.Reader {
+	key := make([]byte, 32)
+	key[0] = byte(seed)
+	c, _ := chacha20.NewUnauthenticatedCipher(key, make([]byte, 12))
+	return cipher.StreamReader{S: c, R: zeroReader{}}
+}
 
-	data := make([]byte, 1024*1024) // 1 MiB
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// TestHashBytes verifies the SHA-512 helper against the standard library.
+func TestHashBytes(t *testing.T) {
+	data := make([]byte, 1024*1024)
 	rand.Read(data)
-	os.WriteFile(path, data, 0o644)
-
-	expected := crypto.HashBytes(data)
-	got, err := crypto.HashFile(path, 65536, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, expected) {
-		t.Fatal("file hash does not match in-memory hash")
+	want := sha512.Sum512(data)
+	if !bytes.Equal(crypto.HashBytes(data), want[:]) {
+		t.Fatal("HashBytes does not match sha512.Sum512")
 	}
 }
 
@@ -206,7 +215,7 @@ func TestStreamTamperedChunk(t *testing.T) {
 
 	plaintext := []byte("tamper test data that is long enough to be meaningful")
 	var ctBuf bytes.Buffer
-	crypto.EncryptStream(aead, baseNonce, bytes.NewReader(plaintext), &ctBuf, false, int64(len(plaintext)))
+	crypto.EncryptStream(aead, baseNonce, config.ChunkSize, bytes.NewReader(plaintext), &ctBuf, false, int64(len(plaintext)))
 
 	// Flip a byte in the ciphertext (after the 4-byte length prefix).
 	ct := ctBuf.Bytes()
@@ -246,7 +255,7 @@ func BenchmarkStreamEncrypt(b *testing.B) {
 	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		crypto.EncryptStream(aead, nonce, bytes.NewReader(data), io.Discard, false, int64(len(data)))
+		crypto.EncryptStream(aead, nonce, config.ChunkSize, bytes.NewReader(data), io.Discard, false, int64(len(data)))
 	}
 }
 

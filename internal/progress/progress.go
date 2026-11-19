@@ -2,7 +2,8 @@
 // file operations such as hashing and encryption.
 //
 // It writes directly to stderr so it never interferes with stdout data.
-// Updates are throttled to avoid excessive terminal I/O.
+// Updates are throttled to avoid excessive terminal I/O. Callers create bars
+// only when stderr is a terminal (see Options.ShowProgress).
 package progress
 
 import (
@@ -44,7 +45,7 @@ func (b *Bar) Add(n int64) {
 	defer b.mu.Unlock()
 
 	b.current += n
-	if b.current > b.total {
+	if b.total > 0 && b.current > b.total {
 		b.current = b.total
 	}
 
@@ -60,7 +61,9 @@ func (b *Bar) Finish() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.current = b.total
+	if b.total > 0 {
+		b.current = b.total
+	}
 	b.done = true
 	b.draw(time.Now())
 	fmt.Fprint(os.Stderr, "\n")

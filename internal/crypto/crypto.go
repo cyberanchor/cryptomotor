@@ -10,10 +10,12 @@
 //   - HMAC is computed over CIPHERTEXT (Encrypt-then-MAC), not plaintext.
 //   - Key material is zeroed after use where practical.
 //
-// Debug logging:
-//   When --debug is enabled, all cryptographic material (keys, salts, nonces,
-//   HMAC values) is written to the log for troubleshooting.  Do NOT use
-//   --debug in production — it exposes secrets in the log file.
+// Logging:
+//
+//	--debug logs only values that are stored in the encrypted file anyway
+//	(salts, nonces, HMAC values) plus sizes and timings. Secrets (password,
+//	derived key, plaintext hash) and per-chunk details are logged only at
+//	the trace level (--trace).
 package crypto
 
 import (
@@ -26,15 +28,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"log/slog"
-	"os"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"cryptomotor/internal/config"
+	"cryptomotor/internal/logger"
 	"cryptomotor/internal/progress"
 )
 
@@ -44,10 +46,11 @@ import (
 
 var (
 	ErrInvalidCipher    = errors.New("crypto: unknown cipher ID")
-	ErrNonceMismatch    = errors.New("crypto: nonce length mismatch")
+	ErrInvalidKey       = errors.New("crypto: wrong key length")
 	ErrHMACMismatch     = errors.New("crypto: HMAC verification failed — wrong password or corrupted file")
 	ErrAuthFailed       = errors.New("crypto: AEAD authentication failed — wrong password or corrupted data")
 	ErrFileHashMismatch = errors.New("crypto: decrypted file hash does not match stored hash")
+	ErrStreamFormat     = errors.New("crypto: malformed encrypted stream")
 )
 
 // ---------------------------------------------------------------------
@@ -67,6 +70,12 @@ func DeriveKey(password []byte, salt []byte, lowMemory bool) []byte {
 		"iterations", config.Argon2Time,
 		"parallelism", config.Argon2Threads,
 	)
+	logger.Trace("Argon2id input",
+		"password", string(password),
+		"password_hex", hex.EncodeToString(password),
+		"password_bytes", len(password),
+	)
+	start := time.Now()
 	key := argon2.IDKey(
 		password,
 		salt,
@@ -75,7 +84,8 @@ func DeriveKey(password []byte, salt []byte, lowMemory bool) []byte {
 		config.Argon2Threads,
 		config.Argon2KeyLen,
 	)
-	slog.Debug("Derived key", "key", hex.EncodeToString(key))
+	slog.Debug("Argon2id finished", "memory_kib", mem, "elapsed", time.Since(start).Round(time.Millisecond))
+	logger.Trace("Derived key", "key", hex.EncodeToString(key))
 	return key
 }
 
@@ -85,6 +95,9 @@ func DeriveKey(password []byte, salt []byte, lowMemory bool) []byte {
 
 // NewAEAD returns an AEAD cipher for the given key and cipher ID.
 func NewAEAD(key []byte, cipherID config.CipherID) (cipher.AEAD, error) {
+	if len(key) != config.Argon2KeyLen {
+		return nil, fmt.Errorf("%w: %d bytes, want %d", ErrInvalidKey, len(key), config.Argon2KeyLen)
+	}
 	switch cipherID {
 	case config.CipherAES256GCM:
 		block, err := aes.NewCipher(key)
@@ -245,77 +258,8 @@ func VerifyHMACStream(key, salt, expected []byte, ciphertextReader io.Reader, en
 }
 
 // ---------------------------------------------------------------------
-// File hashing (SHA-512, streaming)
+// Hashing
 // ---------------------------------------------------------------------
-
-// HashFile computes the SHA-512 digest of the file at path, reading in
-// chunks of bufSize bytes.  If showProgress is true a terminal progress
-// bar is rendered.
-func HashFile(path string, bufSize int, showProgress bool) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open for hashing: %w", err)
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat for hashing: %w", err)
-	}
-
-	slog.Debug("Computing SHA-512 hash", "file", path, "size", info.Size(), "buffer", bufSize)
-
-	h := sha512.New()
-	var result []byte
-	if showProgress && info.Size() > int64(bufSize)*10 {
-		result, err = hashWithProgress(f, h, bufSize, info.Size())
-	} else {
-		result, err = hashPlain(f, h, bufSize)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	slog.Debug("Computed SHA-512 hash", "file", path, "hash", hex.EncodeToString(result))
-	return result, nil
-}
-
-func hashPlain(r io.Reader, h hash.Hash, bufSize int) ([]byte, error) {
-	buf := make([]byte, bufSize)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			h.Write(buf[:n])
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read for hash: %w", err)
-		}
-	}
-	return h.Sum(nil), nil
-}
-
-func hashWithProgress(r io.Reader, h hash.Hash, bufSize int, total int64) ([]byte, error) {
-	bar := progress.New("Hashing", total)
-	buf := make([]byte, bufSize)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			h.Write(buf[:n])
-			bar.Add(int64(n))
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read for hash: %w", err)
-		}
-	}
-	bar.Finish()
-	return h.Sum(nil), nil
-}
 
 // HashBytes computes SHA-512 over an in-memory byte slice.
 func HashBytes(data []byte) []byte {
@@ -362,20 +306,26 @@ func Open(aead cipher.AEAD, nonce, ciphertext []byte) ([]byte, error) {
 // Streaming encryption / decryption for large payloads
 //
 // Each chunk is sealed with nonce = base_nonce XOR chunk_counter.
-// The last chunk is identified by its shorter length.
 //
 // Wire format per chunk:
 //   [4 bytes big-endian ciphertext length][ciphertext + tag]
 //
-// A zero-length record signals EOF.
+// A zero-length record ends the stream; nothing may follow it. The chunk
+// size is chosen by the encoder (ChunkSize, or ChunkSizeLow with
+// --low-memory) and is not stored: a decoder accepts any chunk up to
+// ChunkSize plus the tag.
 // ---------------------------------------------------------------------
 
-// EncryptStream reads plaintext from r and writes chunk-encrypted data to w.
+// EncryptStream reads plaintext from r and writes chunk-encrypted data to w,
+// sealing each chunk of at most chunkSize bytes in place in one reused buffer.
 // It returns the number of plaintext bytes processed.
-func EncryptStream(aead cipher.AEAD, baseNonce []byte, r io.Reader, w io.Writer, showProgress bool, totalSize int64) (int64, error) {
+func EncryptStream(aead cipher.AEAD, baseNonce []byte, chunkSize int, r io.Reader, w io.Writer, showProgress bool, totalSize int64) (int64, error) {
+	if chunkSize <= 0 || chunkSize > config.ChunkSize {
+		return 0, fmt.Errorf("crypto: chunk size %d outside 1..%d", chunkSize, config.ChunkSize)
+	}
 	slog.Debug("EncryptStream started",
 		"base_nonce", hex.EncodeToString(baseNonce),
-		"chunk_size", config.ChunkSize,
+		"chunk_size", chunkSize,
 		"total_size", totalSize,
 	)
 
@@ -384,24 +334,26 @@ func EncryptStream(aead cipher.AEAD, baseNonce []byte, r io.Reader, w io.Writer,
 		bar = progress.New("Encrypting", totalSize)
 	}
 
-	buf := make([]byte, config.ChunkSize)
+	buf := make([]byte, chunkSize+aead.Overhead())
 	var counter uint64
 	var written int64
 
 	for {
-		n, readErr := io.ReadFull(r, buf)
+		n, readErr := io.ReadFull(r, buf[:chunkSize])
 		if n > 0 {
 			nonce := deriveChunkNonce(baseNonce, counter)
-			slog.Debug("Encrypting chunk",
-				"chunk", counter,
-				"plaintext_len", n,
-				"chunk_nonce", hex.EncodeToString(nonce),
-			)
+			ct := aead.Seal(buf[:0], nonce, buf[:n], nil) // in place
+			if logger.TraceEnabled() {
+				logger.Trace("Encrypted chunk",
+					"chunk", counter,
+					"plaintext_len", n,
+					"ciphertext_len", len(ct),
+					"chunk_nonce", hex.EncodeToString(nonce),
+					"tag", hex.EncodeToString(ct[len(ct)-aead.Overhead():]),
+				)
+			}
 			counter++
 
-			ct := aead.Seal(nil, nonce, buf[:n], nil)
-
-			// Write chunk length prefix.
 			var lenBuf [4]byte
 			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(ct)))
 			if _, err := w.Write(lenBuf[:]); err != nil {
@@ -437,7 +389,11 @@ func EncryptStream(aead cipher.AEAD, baseNonce []byte, r io.Reader, w io.Writer,
 }
 
 // DecryptStream reads chunk-encrypted data from r and writes plaintext to w.
-// It returns the number of plaintext bytes written.
+// It returns the number of plaintext bytes written. The stream must end with
+// the zero-length record and nothing after it; a chunk longer than
+// ChunkSize plus the tag is rejected before any memory is allocated for it.
+// Truncation exactly at a chunk boundary (with a new end record) cannot be
+// seen here: at file level HMAC and the SHA-512 of the plaintext catch it.
 func DecryptStream(aead cipher.AEAD, baseNonce []byte, r io.Reader, w io.Writer, showProgress bool, totalSize int64) (int64, error) {
 	slog.Debug("DecryptStream started",
 		"base_nonce", hex.EncodeToString(baseNonce),
@@ -449,48 +405,68 @@ func DecryptStream(aead cipher.AEAD, baseNonce []byte, r io.Reader, w io.Writer,
 		bar = progress.New("Decrypting", totalSize)
 	}
 
+	maxLen := uint32(config.ChunkSize + aead.Overhead())
+	var buf []byte
 	var counter uint64
-	var written int64
+	var written, consumed, reported int64
 	var lenBuf [4]byte
 
 	for {
 		// Read chunk length.
 		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
+				return written, fmt.Errorf("%w: missing end-of-stream record after %d chunks", ErrStreamFormat, counter)
 			}
 			return written, fmt.Errorf("read chunk length: %w", err)
 		}
+		consumed += 4
 		chunkLen := binary.BigEndian.Uint32(lenBuf[:])
 		if chunkLen == 0 {
 			break // EOF sentinel
 		}
+		if chunkLen <= uint32(aead.Overhead()) || chunkLen > maxLen {
+			return written, fmt.Errorf("%w: chunk %d has length %d (allowed %d..%d)",
+				ErrStreamFormat, counter, chunkLen, aead.Overhead()+1, maxLen)
+		}
 
-		ct := make([]byte, chunkLen)
+		if uint32(cap(buf)) < chunkLen {
+			buf = make([]byte, chunkLen)
+		}
+		ct := buf[:chunkLen]
 		if _, err := io.ReadFull(r, ct); err != nil {
 			return written, fmt.Errorf("read chunk data: %w", err)
 		}
+		consumed += int64(chunkLen)
 
 		nonce := deriveChunkNonce(baseNonce, counter)
-		slog.Debug("Decrypting chunk",
-			"chunk", counter,
-			"ciphertext_len", chunkLen,
-			"chunk_nonce", hex.EncodeToString(nonce),
-		)
-		counter++
-
-		pt, err := aead.Open(nil, nonce, ct, nil)
+		pt, err := aead.Open(ct[:0], nonce, ct, nil) // in place
+		if logger.TraceEnabled() {
+			logger.Trace("Decrypted chunk",
+				"chunk", counter,
+				"ciphertext_len", chunkLen,
+				"chunk_nonce", hex.EncodeToString(nonce),
+				"ok", err == nil,
+			)
+		}
 		if err != nil {
-			slog.Debug("Chunk decryption FAILED", "chunk", counter-1, "error", err)
+			slog.Debug("Chunk decryption FAILED", "chunk", counter, "error", err)
 			return written, ErrAuthFailed
 		}
+		counter++
 		if _, err := w.Write(pt); err != nil {
 			return written, fmt.Errorf("write plaintext: %w", err)
 		}
 		written += int64(len(pt))
-		if bar != nil {
-			bar.Add(int64(len(pt)))
+		if bar != nil { // the total is the ciphertext size
+			bar.Add(consumed - reported)
+			reported = consumed
 		}
+	}
+
+	// Nothing may follow the end record.
+	var extra [1]byte
+	if n, _ := r.Read(extra[:]); n > 0 {
+		return written, fmt.Errorf("%w: data after the end-of-stream record", ErrStreamFormat)
 	}
 
 	if bar != nil {

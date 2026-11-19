@@ -1,19 +1,34 @@
-// Package logger provides a thin wrapper around the standard log/slog
-// package with colorized console output and rotating file logging.
+// Package logger provides user-facing console messages and structured
+// log/slog records for cryptomotor.
 //
-// Design decisions:
-//   - NEVER log key material, salts, or nonces — even at debug level.
-//   - Colorized stderr output for interactive use; plain text for log files.
-//   - Singleton pattern via Init/Get to avoid passing loggers everywhere.
+// Levels:
+//   - default:   warnings and errors from slog, plus every console message;
+//   - --verbose: informational records;
+//   - --debug:   header fields, nonces, sizes, timings: data stored in the
+//     encrypted file anyway, never keys, passwords or plaintext hashes;
+//   - --trace:   everything, including the password, derived keys, plaintext
+//     hashes and original file names (LevelTrace).
+//
+// Console messages (Info, Success, Warn, Error) go to stderr, with colours
+// only when stderr is a terminal and NO_COLOR is unset. When --log is given,
+// the same messages and the enabled slog records are also written to that
+// file in slog's text format.
 package logger
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/term"
 )
 
 // ANSI color codes used for terminal output.
@@ -25,103 +40,163 @@ const (
 	colorCyan   = "\033[36m"
 )
 
+// LevelTrace is the slog level of records that contain secrets.
+const LevelTrace = slog.Level(-8)
+
 var (
-	instance *slog.Logger
 	once     sync.Once
+	mu       sync.Mutex // serialises console and file writes
 	logFile  *os.File
+	fileSink slog.Handler // nil without --log
+	useColor bool
 )
 
-// Init creates the global logger. Call once at program startup.
-// logPath is the file path for the persistent log; pass "" to disable file logging.
-// verbose enables INFO-level console output; debug enables DEBUG-level.
-func Init(logPath string, verbose, debug bool) error {
+// Init configures the global logger. Call once at program startup; later
+// calls are ignored. logPath "" disables file logging.
+func Init(logPath string, verbose, debug, trace bool) error {
 	var initErr error
 	once.Do(func() {
 		level := slog.LevelWarn
-		if debug {
+		switch {
+		case trace:
+			level = LevelTrace
+		case debug:
 			level = slog.LevelDebug
-		} else if verbose {
+		case verbose:
 			level = slog.LevelInfo
 		}
+		opts := &slog.HandlerOptions{Level: level, ReplaceAttr: renameTrace}
 
 		var writers []io.Writer
-
-		// File handler (plain text, always DEBUG level for post-mortem analysis).
 		if logPath != "" {
-			dir := filepath.Dir(logPath)
-			if err := os.MkdirAll(dir, 0o750); err != nil {
+			if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 				initErr = fmt.Errorf("create log directory: %w", err)
 				return
 			}
-			f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+			// 0600: with --trace the file holds passwords and keys.
+			f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 			if err != nil {
 				initErr = fmt.Errorf("open log file: %w", err)
 				return
 			}
 			logFile = f
+			fileSink = slog.NewTextHandler(f, opts)
 			writers = append(writers, f)
 		}
-
-		// Console handler (stderr, respects verbosity level).
 		writers = append(writers, os.Stderr)
+		slog.SetDefault(slog.New(slog.NewTextHandler(io.MultiWriter(writers...), opts)))
 
-		w := io.MultiWriter(writers...)
-		instance = slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{
-			Level: level,
-		}))
+		useColor = colorWanted(term.IsTerminal(int(os.Stderr.Fd())), os.Getenv("NO_COLOR"))
 
-		// Set as default so slog.Debug() etc. work without passing the logger.
-		slog.SetDefault(instance)
-
-		if debug {
-			fmt.Fprintf(os.Stderr,
-				colorYellow+"WARNING: Debug mode is ON — keys, salts, nonces, and HMAC values "+
-					"will be written to logs. Do NOT use --debug in production."+colorReset+"\n")
+		if trace {
+			Warn("--trace prints the password, derived keys, plaintext hashes and file names. " +
+				"Do not use it on a shared system; delete the output and any --log file afterwards.")
 		}
 	})
 	return initErr
 }
 
-// Get returns the global logger. Panics if Init was not called.
-func Get() *slog.Logger {
-	if instance == nil {
-		// Fallback: create a minimal logger so we don't crash.
-		instance = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
-		}))
-	}
-	return instance
+// colorWanted applies the NO_COLOR convention (https://no-color.org).
+func colorWanted(isTerminal bool, noColor string) bool {
+	return isTerminal && noColor == ""
 }
 
-// Close flushes and closes the log file, if any. Call in main's defer.
+// renameTrace prints LevelTrace as "TRACE" instead of "DEBUG-4".
+func renameTrace(_ []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.LevelKey {
+		if l, ok := a.Value.Any().(slog.Level); ok && l == LevelTrace {
+			a.Value = slog.StringValue("TRACE")
+		}
+	}
+	return a
+}
+
+// Close closes the log file, if any. Call in main's defer.
 func Close() {
+	mu.Lock()
+	defer mu.Unlock()
 	if logFile != nil {
 		_ = logFile.Close()
+		logFile, fileSink = nil, nil
 	}
 }
 
+// TraceEnabled reports whether --trace is on; use it to skip building
+// expensive trace attributes.
+func TraceEnabled() bool { return slog.Default().Enabled(context.Background(), LevelTrace) }
+
+// DebugEnabled reports whether --debug (or --trace) is on.
+func DebugEnabled() bool { return slog.Default().Enabled(context.Background(), slog.LevelDebug) }
+
+// Trace logs a record that may contain secrets; it is shown only with --trace.
+func Trace(msg string, args ...any) {
+	slog.Log(context.Background(), LevelTrace, msg, args...)
+}
+
 // ---------------------------------------------------------------------
-// Convenience wrappers with color for direct console messages.
-// These bypass slog and print to stderr with ANSI colors.
-// Use for user-facing status lines, NOT for structured log records.
+// Console messages
 // ---------------------------------------------------------------------
 
-// Info prints a cyan informational message to stderr.
-func Info(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, colorCyan+format+colorReset+"\n", args...)
+// Info prints an informational message.
+func Info(format string, args ...any) { emit(slog.LevelInfo, colorCyan, "", format, args) }
+
+// Success prints a success message.
+func Success(format string, args ...any) { emit(slog.LevelInfo, colorGreen, "", format, args) }
+
+// Warn prints a warning.
+func Warn(format string, args ...any) { emit(slog.LevelWarn, colorYellow, "WARNING: ", format, args) }
+
+// Error prints an error.
+func Error(format string, args ...any) { emit(slog.LevelError, colorRed, "ERROR: ", format, args) }
+
+func emit(level slog.Level, color, prefix, format string, args []any) {
+	msg := prefix + Clean(fmt.Sprintf(format, args...))
+	mu.Lock()
+	defer mu.Unlock()
+	if useColor {
+		fmt.Fprint(os.Stderr, color+msg+colorReset+"\n")
+	} else {
+		fmt.Fprint(os.Stderr, msg+"\n")
+	}
+	if fileSink != nil {
+		_ = fileSink.Handle(context.Background(), slog.NewRecord(time.Now(), level, msg, 0))
+	}
 }
 
-// Success prints a green success message to stderr.
-func Success(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, colorGreen+format+colorReset+"\n", args...)
+// Clean makes a string safe to print on a terminal: control characters,
+// Unicode format characters (bidirectional overrides, zero-width marks),
+// line separators and invalid UTF-8 bytes are shown as \xNN or \uNNNN
+// escapes. A file name from an encrypted file can contain any of them.
+func Clean(s string) string {
+	clean := true
+	for _, r := range s {
+		if unsafeRune(r) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, w := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && w == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case unsafeRune(r) && r < 0x80:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		case unsafeRune(r):
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteString(s[i : i+w])
+		}
+		i += w
+	}
+	return b.String()
 }
 
-// Warn prints a yellow warning message to stderr.
-func Warn(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, colorYellow+"WARNING: "+format+colorReset+"\n", args...)
-}
-
-// Error prints a red error message to stderr.
-func Error(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, colorRed+"ERROR: "+format+colorReset+"\n", args...)
+func unsafeRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || r == utf8.RuneError ||
+		unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r)
 }
